@@ -75,11 +75,22 @@ class MiniMindVLM(MiniMindForCausalLM):
         return img_embedding
 
     def count_vision_proj(self, tokens, h, vision_tensors=None, seqlen=512):
+        """Replace image placeholder tokens in hidden states with projected vision features.
+
+        Args:
+            tokens: input token ids, shape (batch, seq_len)
+            h: text hidden states from embedding layer, shape (batch, seq_len, hidden_dim)
+            vision_tensors: CLIP image embeddings, shape (batch, num_images, 196, 768)
+            seqlen: max sequence length to truncate to
+        """
         def find_indices(tokens, image_ids):
+            """Locate contiguous runs of image_ids (e.g. 196 consecutive token-34s) in the token sequence.
+            Returns {batch_idx: [(start, end), ...]} or None if no match found."""
             image_ids_tensor = torch.tensor(image_ids).to(tokens.device)
             len_image_ids = len(image_ids)
             if len_image_ids > tokens.size(1):
                 return None
+            # Sliding window: (batch, seq_len - len_image_ids + 1, len_image_ids)
             tokens_view = tokens.unfold(1, len_image_ids, 1)
             matches = (tokens_view == image_ids_tensor).all(dim=2)
             return {
@@ -90,9 +101,11 @@ class MiniMindVLM(MiniMindForCausalLM):
 
         image_indices = find_indices(tokens, self.params.image_ids)
         if vision_tensors is not None and image_indices:
+            # Project CLIP features (768-d) into the LLM's hidden dimension (512-d)
             vision_proj = self.vision_proj(vision_tensors)
             if len(vision_proj.shape) == 3:
                 vision_proj = vision_proj.unsqueeze(0)
+            # For each sample in the batch, splice vision features into the placeholder positions
             new_h = []
             for i in range(h.size(0)):
                 if i in image_indices:
@@ -100,6 +113,7 @@ class MiniMindVLM(MiniMindForCausalLM):
                     img_idx = 0
                     for start_idx, end_idx in image_indices[i]:
                         if img_idx < vision_proj.size(1):
+                            # Replace: h[..., :start] + vision_features + h[..., end+1:]
                             h_i = torch.cat((h_i[:start_idx], vision_proj[i][img_idx], h_i[end_idx + 1:]), dim=0)[
                                   :seqlen]
                             img_idx += 1
@@ -142,6 +156,7 @@ class MiniMindVLM(MiniMindForCausalLM):
             self.model.freqs_sin[start_pos:start_pos + seq_length]
         )
 
+        # Pass hidden states through each transformer layer, optionally using KV cache
         presents = []
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.model.layers, past_key_values)):
             hidden_states, present = layer(
@@ -153,12 +168,16 @@ class MiniMindVLM(MiniMindForCausalLM):
             )
             presents.append(present)
 
+        # Final RMSNorm before the output head
         hidden_states = self.model.norm(hidden_states)
 
+        # Aggregate auxiliary load-balancing loss from MoE layers (zero if not using MoE)
         aux_loss = sum([l.mlp.aux_loss for l in self.model.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        # Only project the last `logits_to_keep` tokens to save compute during inference
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        # Compute next-token prediction loss with shifted labels (predict token t+1 from position t)
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()

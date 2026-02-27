@@ -33,6 +33,7 @@ class VLMDataset(Dataset):
         messages = []
         for i, turn in enumerate(conversations):
             role = 'user' if i % 2 == 0 else 'assistant'
+            # Replace the image placeholder with the image token placeholder (196 * '@')
             messages.append({"role": role, "content": turn['content'].replace('<image>', self.image_token)})
         return self.tokenizer.apply_chat_template(
             messages,
